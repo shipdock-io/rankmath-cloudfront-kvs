@@ -28,7 +28,8 @@ async function handler(event) {
 
 async function lookup(key) {
   try {
-    return JSON.parse(await kvs.get(key));
+    const value = await kvs.get(key);
+    return JSON.parse(value);
   } catch (e) {
     return null;
   }
