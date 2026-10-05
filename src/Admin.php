@@ -6,6 +6,11 @@ final class Admin
 {
     private const PAGE = 'rankmath-cloudfront-kvs';
     private const PUSH_ACTION = 'rm_cf_kvs_push';
+    private const STEP_ACTION = 'rm_cf_kvs_push_step';
+    private const JOB_OPTION = 'rm_cf_kvs_job';
+
+    // Less than typical 30s proxy, load balancer or PHP timeouts.
+    private const STEP_SECONDS = 15;
 
     public function register(): void
     {
@@ -17,36 +22,70 @@ final class Admin
             register_setting(self::PAGE, Settings::OPTION, ['sanitize_callback' => [Settings::class, 'sanitize']]);
         });
 
-        add_action('admin_post_' . self::PUSH_ACTION, [$this, 'handlePush']);
+        add_action('wp_ajax_' . self::PUSH_ACTION, [$this, 'handleStart']);
+        add_action('wp_ajax_' . self::STEP_ACTION, [$this, 'handleStep']);
     }
 
-    public function handlePush(): void
+    public function handleStart(): void
     {
-        if (!current_user_can('manage_options')) {
-            wp_die('You are not allowed to do that.', 403);
-        }
-
-        check_admin_referer(self::PUSH_ACTION);
-
-        $dryRun = !empty($_POST['dry_run']);
+        $this->authorize();
 
         try {
-            $result = Plugin::sync(Settings::afterPush(), $dryRun)->run();
-            $notice = [$result['error'] ? 'error' : 'success', Plugin::summary($result, $dryRun)];
+            $job = Plugin::sync(Settings::afterPush(), !empty($_POST['dry_run']))->plan();
         } catch (\RuntimeException $e) {
-            $notice = ['error', $e->getMessage()];
+            wp_send_json_error(['message' => $e->getMessage()]);
         }
 
-        set_transient($this->noticeKey(), $notice, MINUTE_IN_SECONDS);
-        wp_safe_redirect(admin_url('tools.php?page=' . self::PAGE));
-        exit;
+        // Replace any unfinished push.
+        update_option(self::JOB_OPTION, $job, false);
+        $this->respond($job, false);
+    }
+
+    public function handleStep(): void
+    {
+        $this->authorize();
+
+        $job = get_option(self::JOB_OPTION);
+
+        if (!is_array($job)) {
+            wp_send_json_error(['message' => 'There is no push in progress.']);
+        }
+
+        try {
+            $job = Plugin::sync($job['after_push'], $job['dry_run'])->step($job, microtime(true) + self::STEP_SECONDS);
+        } catch (\RuntimeException $e) {
+            $job['error'] = $e->getMessage();
+        }
+
+        $done = RedirectSync::isDone($job);
+        $done ? delete_option(self::JOB_OPTION) : update_option(self::JOB_OPTION, $job, false);
+        $this->respond($job, $done);
+    }
+
+    private function authorize(): void
+    {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => 'You are not allowed to do that.'], 403);
+        }
+
+        check_ajax_referer(self::PUSH_ACTION);
+    }
+
+    private function respond(array $job, bool $done): never
+    {
+        wp_send_json_success([
+            'done' => $done,
+            'error' => $job['error'] !== null,
+            'redirects' => $job['redirects'],
+            'total' => $job['total'],
+            'message' => $done
+                ? Plugin::summary($job, $job['dry_run'])
+                : sprintf('%s %d of %d redirects…', $job['dry_run'] ? 'Checked' : 'Pushed', $job['redirects'], $job['total']),
+        ]);
     }
 
     public function render(): void
     {
-        $notice = get_transient($this->noticeKey());
-        delete_transient($this->noticeKey());
-
         $settings = Settings::get();
         $envArn = Settings::arnFromEnvironment();
         $name = Settings::OPTION;
@@ -55,10 +94,6 @@ final class Admin
             <h1>Redirects to CloudFront</h1>
 
             <?php settings_errors(Settings::OPTION); ?>
-
-            <?php if ($notice) : ?>
-                <div class="notice notice-<?php echo esc_attr($notice[0]); ?>"><p><?php echo esc_html($notice[1]); ?></p></div>
-            <?php endif; ?>
 
             <form method="post" action="options.php">
                 <?php settings_fields(self::PAGE); ?>
@@ -93,18 +128,75 @@ final class Admin
 
             <h2>Push</h2>
             <p>Pushes all active, exact-match Rank Math redirects to the KeyValueStore.</p>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+            <p>Large pushes are split across several requests. Keep this page open until the push finishes.</p>
+            <form id="rm-cf-kvs-push" method="post" action="<?php echo esc_url(admin_url('admin-ajax.php')); ?>">
                 <input type="hidden" name="action" value="<?php echo esc_attr(self::PUSH_ACTION); ?>">
                 <?php wp_nonce_field(self::PUSH_ACTION); ?>
                 <p><label><input type="checkbox" name="dry_run" value="1" checked> Dry run</label></p>
                 <?php submit_button('Push redirects', 'primary', 'submit', false); ?>
+                <p><progress max="1" value="0" style="width: 100%; max-width: 40em" hidden></progress></p>
+                <div class="notice inline" role="status" hidden><p></p></div>
             </form>
+            <script>
+                (() => {
+                    const form = document.getElementById('rm-cf-kvs-push');
+
+                    const url = form.getAttribute('action');
+                    const button = form.querySelector('[type="submit"]');
+                    const progress = form.querySelector('progress');
+                    const status = form.querySelector('[role="status"]');
+                    const warn = (event) => event.preventDefault();
+
+                    const show = (type, message) => {
+                        status.className = `notice notice-${type} inline`;
+                        status.firstElementChild.textContent = message;
+                        status.hidden = false;
+                    };
+
+                    const post = async (action) => {
+                        const data = new FormData(form);
+                        data.set('action', action);
+
+                        const response = await fetch(url, { method: 'POST', body: data, credentials: 'same-origin' });
+                        const json = await response.json().catch(() => null);
+
+                        if (!json) {
+                            throw new Error(`The request failed (HTTP ${response.status}).`);
+                        }
+
+                        if (!json.success) {
+                            throw new Error(json.data.message);
+                        }
+
+                        progress.value = json.data.total ? json.data.redirects / json.data.total : 0;
+                        show(json.data.error ? 'error' : (json.data.done ? 'success' : 'info'), json.data.message);
+
+                        return json.data;
+                    };
+
+                    form.addEventListener('submit', async (event) => {
+                        event.preventDefault();
+                        button.disabled = true;
+                        progress.hidden = false;
+                        progress.value = 0;
+                        addEventListener('beforeunload', warn);
+
+                        try {
+                            let job = await post(<?php echo wp_json_encode(self::PUSH_ACTION); ?>);
+
+                            while (!job.done) {
+                                job = await post(<?php echo wp_json_encode(self::STEP_ACTION); ?>);
+                            }
+                        } catch (error) {
+                            show('error', error.message);
+                        } finally {
+                            removeEventListener('beforeunload', warn);
+                            button.disabled = false;
+                        }
+                    });
+                })();
+            </script>
         </div>
         <?php
-    }
-
-    private function noticeKey(): string
-    {
-        return 'rm_cf_kvs_notice_' . get_current_user_id();
     }
 }

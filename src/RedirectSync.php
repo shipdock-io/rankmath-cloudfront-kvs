@@ -16,32 +16,94 @@ final class RedirectSync
     }
 
     /**
-     * @return array{redirects: int, keys: int, skipped: int, error: ?string}
+     * Pushes everything in one go. This does not batch requests, and so should
+     * not be used via HTTP as it's likely to result in a timeout.
      */
     public function run(): array
     {
-        [$redirects, $skipped] = $this->collect();
-        $result = ['redirects' => 0, 'keys' => 0, 'skipped' => $skipped, 'error' => null];
+        return $this->step($this->plan());
+    }
 
+    /**
+     * Snapshots what to push, so that a push split across requests isn't
+     * affected by its own changes (e.g. an older duplicate no longer
+     * being shadowed once the newer is inactive).
+     *
+     * @return array{
+     *  batches: list<array{
+     *    ids: int[],
+     *    keys: array<string, string>
+     *  }>,
+     *  total: int,
+     *  redirects: int,
+     *  keys: int,
+     *  skipped: int,
+     *  error: ?string,
+     *  after_push: string,
+     *  dry_run: bool
+     * }
+     */
+    public function plan(): array
+    {
+        [$redirects, $skipped] = $this->collect();
+        $batches = [];
+
+        foreach ($this->batches($redirects) as $batch) {
+            $batches[] = [
+                'ids' => array_column($batch, 'id'),
+                'keys' => array_merge(...array_column($batch, 'keys')),
+            ];
+        }
+
+        return [
+            'batches' => $batches,
+            'total' => count($redirects),
+            'redirects' => 0,
+            'keys' => 0,
+            'skipped' => $skipped,
+            'error' => null,
+            'after_push' => $this->afterPush,
+            'dry_run' => $this->dryRun,
+        ];
+    }
+
+    /**
+     * Pushes batches from the plan until it is exhausted, or the deadline
+     * passes. At least one batch is always pushed, so each step makes progress.
+     */
+    public function step(array $job, ?float $deadline = null): array
+    {
         try {
             $etag = $this->kvs->etag();
 
-            foreach ($this->batches($redirects) as $batch) {
-                $keys = array_merge(...array_column($batch, 'keys'));
-
+            while ($batch = array_shift($job['batches'])) {
                 if (!$this->dryRun) {
-                    $etag = $this->kvs->putKeys($etag, $keys);
-                    $this->applyAfterPush(array_column($batch, 'id'));
+                    $etag = $this->kvs->putKeys($etag, $batch['keys']);
+                    $this->applyAfterPush($batch['ids']);
                 }
 
-                $result['redirects'] += count($batch);
-                $result['keys'] += count($keys);
+                $job['redirects'] += count($batch['ids']);
+                $job['keys'] += count($batch['keys']);
+
+                if ($deadline !== null && microtime(true) >= $deadline) {
+                    break;
+                }
             }
         } catch (\RuntimeException $e) {
-            $result['error'] = $e->getMessage();
+            if (isset($batch)) {
+                // Leave failed batches at the front of the plan.
+                array_unshift($job['batches'], $batch);
+            }
+
+            $job['error'] = $e->getMessage();
         }
 
-        return $result;
+        return $job;
+    }
+
+    public static function isDone(array $job): bool
+    {
+        return !$job['batches'] || $job['error'] !== null;
     }
 
     private function collect(): array
@@ -77,7 +139,7 @@ final class RedirectSync
         return [$redirects, $skipped];
     }
 
-    // Returns null unless every source on the redirect is a plain exact-match path.
+    // Returns null unless every source on the redirect is a plain exact-match.
     private function keysFor(object $row): ?array
     {
         $sources = maybe_unserialize($row->sources);
