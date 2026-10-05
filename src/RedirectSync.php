@@ -55,7 +55,7 @@ final class RedirectSync
         }
 
         $rows = $wpdb->get_results(
-            "SELECT id, sources, url_to, header_code FROM {$table} WHERE status = 'active' ORDER BY id"
+            "SELECT id, sources, url_to, header_code FROM {$table} WHERE status = 'active' ORDER BY updated DESC, id ASC"
         );
 
         $redirects = [];
@@ -63,7 +63,6 @@ final class RedirectSync
         $seen = [];
 
         foreach ($rows as $row) {
-            // First redirect to claim a path wins; later duplicates are dropped.
             $keys = array_diff_key($this->keysFor($row) ?? [], $seen);
 
             if (!$keys || count($keys) > self::MAX_KEYS_PER_REQUEST) {
