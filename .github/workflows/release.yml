@@ -1,0 +1,32 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check plugin header matches tag
+        run: |
+          header=$(sed -nE 's/^ \* Version: *([^ ]+) *$/\1/p' rankmath-cloudfront-kvs.php)
+          tag=${GITHUB_REF_NAME#v}
+
+          if [ "$header" != "$tag" ]; then
+            echo "::error file=rankmath-cloudfront-kvs.php::Plugin header Version is '${header}', but the tag is '${GITHUB_REF_NAME}'."
+            exit 1
+          fi
+
+      - name: Validate composer.json
+        run: composer validate --strict --no-check-lock
+
+      - name: Create release
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Rank Math Redirects to CloudFront KVS
  * Description: Offloads Rank Math exact-match redirects to CloudFront.
- * Version: 1.1.0
+ * Version: 1.2.0
  * Requires PHP: 8.1
  */
 
